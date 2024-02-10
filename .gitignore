@@ -8,3 +8,10 @@ __pycache__/
 *.pt
 *.pyc
 input.txt
+
+job.sh
+out-*
+*.out
+data/enwik8
+data/enwik8/*
+wandb

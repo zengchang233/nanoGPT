@@ -29,6 +29,8 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+from ipdb import set_trace
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -131,6 +133,8 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
+#  set_trace()
+
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -212,6 +216,7 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    out_bpc = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
@@ -221,8 +226,10 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+        # compute bpc
+        out_bpc[split] = out[split] / math.log(2)
     model.train()
-    return out
+    return out, out_bpc
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -243,6 +250,7 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+#  set_trace()
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -258,13 +266,15 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        losses, bpcs = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} train bpc {bpcs['train']:.4f}, val bpc {bpcs['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/bpc": bpcs['train'],
+                "val/bpc": bpcs['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
