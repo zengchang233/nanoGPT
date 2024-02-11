@@ -24,11 +24,12 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+from scheduler import WarmupLR
 from ipdb import set_trace
 
 # -----------------------------------------------------------------------------
@@ -117,6 +118,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+test_data = np.memmap(os.path.join(data_dir, 'test.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -128,6 +130,58 @@ def get_batch(split):
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+
+def read_file(file_path, chunk_size=128): # chunk_size = 128
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+def encode_data(file_path, chunk_size=128):
+    encoded_data = []
+    for chunk in read_file(file_path, chunk_size):
+        # encoded_data += [byte for byte in chunk]
+        encoded_data.append([byte for byte in chunk])
+    return encoded_data
+
+#  chunk_size = 1024
+#  data_root = './data/enwik8/'
+
+# Paths to your data files
+#  train_file_path = os.path.join(data_root, 'train.txt.raw')
+#  valid_file_path = os.path.join(data_root, 'valid.txt.raw')
+
+# Encode the data
+#  train_data = encode_data(train_file_path, chunk_size)
+#  valid_data = encode_data(valid_file_path, chunk_size // 8)
+
+#  def cycle(loader):
+#      while True:
+#          for data in loader:
+#              yield data
+#
+#  class TextSamplerDataset(Dataset):
+#      def __init__(self, data, seq_len):
+#          super().__init__()
+#          self.data = data
+#          self.seq_len = seq_len
+#
+#      def __getitem__(self, index):
+#          rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+#          full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
+#          return full_seq.cuda()
+#
+#      def __len__(self):
+#          return self.data.size(0) // self.seq_len
+#
+#  train_dataset = TextSamplerDataset(train_data, seq_len)
+#  val_dataset   = TextSamplerDataset(val_data, seq_len)
+#  test_dataset = TextSamplerDataset(test_data, seq_len)
+#  train_loader  = cycle(DataLoader(train_dataset, batch_size = batch_size))
+#  val_loader    = cycle(DataLoader(val_dataset, batch_size = batch_size))
+#  test_loader   = cycle(DataLoader(test_dataset, batch_size = batch_size))
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -172,6 +226,7 @@ elif init_from == 'resume':
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    #  set_trace()
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
@@ -179,6 +234,13 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    print(f"best validation loss is {best_val_loss}")
+    config = checkpoint['config']
+    learning_rate = config['learning_rate'][0] / 2
+    print(f"decay learning rate to half {learning_rate}")
+    if master_process:
+        out_dir = out_dir + '-resume'
+        os.makedirs(out_dir, exist_ok=True)
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -198,6 +260,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+print(f"learning rate {learning_rate}")
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -232,18 +295,19 @@ def estimate_loss():
     return out, out_bpc
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+#  def get_lr(it):
+    #  # 1) linear warmup for warmup_iters steps
+    #  if it < warmup_iters:
+    #      return learning_rate * it / warmup_iters
+    #  # 2) if it > lr_decay_iters, return min learning rate
+    #  if it > lr_decay_iters:
+    #      return min_lr
+    #  # 3) in between, use cosine decay down to min learning rate
+    #  decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    #  assert 0 <= decay_ratio <= 1
+    #  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+#      return min_lr + coeff * (learning_rate - min_lr)
+scheduler = WarmupLR(optimizer, warmup_steps=warmup_iters)
 
 # logging
 if wandb_log and master_process:
@@ -260,9 +324,12 @@ running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    #  lr = get_lr(iter_num) if decay_lr else learning_rate
+    #  for param_group in optimizer.param_groups:
+    #      param_group['lr'] = lr
+
+    # update learning rate in config for resuming
+    config['learning_rate'] = scheduler.get_lr()[0]
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -275,7 +342,7 @@ while True:
                 "val/loss": losses['val'],
                 "train/bpc": bpcs['train'],
                 "val/bpc": bpcs['val'],
-                "lr": lr,
+                "lr": config['learning_rate'],
                 "mfu": running_mfu*100, # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
@@ -284,6 +351,7 @@ while True:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler,
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -319,6 +387,8 @@ while True:
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+
+    scheduler.step()
 
     # timing and logging
     t1 = time.time()
